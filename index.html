@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>證件拍照</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    /* ── Camera screen ── */
+    #camera-container {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    #guide-frame {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: min(85vw, calc(85vh * 1.58));
+      /* 不使用 aspect-ratio（Safari 15 才支援，需相容 iOS 14.5）*/
+      height: min(calc(85vw / 1.58), 85vh);
+      border: 3px solid white;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
+      border-radius: 4px;
+      pointer-events: none;
+    }
+
+    #guide-label {
+      position: absolute;
+      top: -30px;
+      left: 0;
+      right: 0;
+      text-align: center;
+      color: white;
+      font-size: 13px;
+      letter-spacing: 0.5px;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+    }
+
+    #debug-info {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      font-size: 11px;
+      color: lime;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 4px 7px;
+      border-radius: 3px;
+      font-family: monospace;
+      pointer-events: none;
+      white-space: nowrap;
+      z-index: 10;
+    }
+
+    #capture-btn {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      border: 4px solid white;
+      background: rgba(255, 255, 255, 0.25);
+      cursor: pointer;
+      transition: background 0.15s;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #capture-btn::after {
+      content: '';
+      display: block;
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: white;
+    }
+
+    #capture-btn:active {
+      background: rgba(255, 255, 255, 0.5);
+    }
+
+    #capture-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    #error-msg {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: white;
+      text-align: center;
+      padding: 24px 28px;
+      background: rgba(0, 0, 0, 0.75);
+      border-radius: 10px;
+      font-size: 15px;
+      line-height: 1.7;
+      display: none;
+      z-index: 20;
+      max-width: 80vw;
+    }
+
+    /* ── Result screen ── */
+    #result-container {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: #111;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+    }
+
+    #result-label {
+      color: rgba(255, 255, 255, 0.55);
+      font-size: 13px;
+      letter-spacing: 0.5px;
+    }
+
+    #result-img {
+      max-width: 90vw;
+      max-height: 65vh;
+      border-radius: 6px;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+    }
+
+    #retake-btn {
+      padding: 12px 36px;
+      border-radius: 24px;
+      border: 2px solid rgba(255, 255, 255, 0.7);
+      background: transparent;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    #retake-btn:active {
+      background: rgba(255, 255, 255, 0.12);
+    }
+  </style>
+</head>
+<body>
+
+<!-- Camera screen -->
+<div id="camera-container">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="guide-frame">
+    <div id="guide-label">請將證件放入框內</div>
+  </div>
+  <div id="debug-info">等待相機...</div>
+  <button id="capture-btn" disabled aria-label="拍照"></button>
+  <div id="error-msg"></div>
+</div>
+
+<!-- Result screen -->
+<div id="result-container">
+  <div id="result-label">裁切結果預覽</div>
+  <img id="result-img" alt="裁切結果">
+  <button id="retake-btn">重拍</button>
+</div>
+
+<!-- Hidden canvas for cropping -->
+<canvas id="canvas" style="display:none"></canvas>
+
+<script>
+  const video        = document.getElementById('video');
+  const guideFrame   = document.getElementById('guide-frame');
+  const debugInfo    = document.getElementById('debug-info');
+  const captureBtn   = document.getElementById('capture-btn');
+  const errorMsg     = document.getElementById('error-msg');
+  const cameraContainer = document.getElementById('camera-container');
+  const resultContainer = document.getElementById('result-container');
+  const resultImg    = document.getElementById('result-img');
+  const retakeBtn    = document.getElementById('retake-btn');
+  const canvas       = document.getElementById('canvas');
+  const ctx          = canvas.getContext('2d');
+
+  let stream = null;
+
+  // ── Error display ──
+  function showError(msg) {
+    errorMsg.textContent = msg;
+    errorMsg.style.display = 'block';
+    debugInfo.style.display = 'none';
+    captureBtn.disabled = true;
+  }
+
+  // ── Start camera ──
+  async function startCamera() {
+    errorMsg.style.display = 'none';
+    debugInfo.style.display = '';
+    captureBtn.disabled = true;
+    debugInfo.textContent = '等待相機...';
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width:  { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      });
+    } catch (_) {
+      // Desktop fallback: no facingMode constraint
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      } catch (err) {
+        showError('無法存取相機。\n請確認已允許相機存取權限後重新整理頁面。');
+        return;
+      }
+    }
+
+    video.srcObject = stream;
+  }
+
+  // ── Enable button once video metadata is ready ──
+  video.addEventListener('loadedmetadata', () => {
+    captureBtn.disabled = false;
+    updateDebug();
+  });
+
+  // ── Calculate crop parameters ──
+  // Accounts for object-fit: cover offset so the cropped region
+  // matches exactly what is visible inside the guide frame.
+  function calcCropParams() {
+    const displayW = video.offsetWidth;
+    const displayH = video.offsetHeight;
+    const vW = video.videoWidth;
+    const vH = video.videoHeight;
+
+    // CSS-pixel-per-video-pixel scale under object-fit: cover
+    const ratio = Math.max(displayW / vW, displayH / vH);
+
+    // Margins cropped by cover (in video pixels)
+    const offsetX = (vW - displayW / ratio) / 2;
+    const offsetY = (vH - displayH / ratio) / 2;
+
+    // Guide frame position relative to the video element (CSS pixels)
+    const frameRect = guideFrame.getBoundingClientRect();
+    const videoRect = video.getBoundingClientRect();
+
+    const cssX = frameRect.left - videoRect.left;
+    const cssY = frameRect.top  - videoRect.top;
+    const cssW = frameRect.width;
+    const cssH = frameRect.height;
+
+    // Convert to video pixel coordinates
+    const srcX = Math.max(0, cssX / ratio + offsetX);
+    const srcY = Math.max(0, cssY / ratio + offsetY);
+    // Clamp srcW/srcH so drawImage never exceeds video boundaries (Safari silent fail)
+    const srcW = Math.min(cssW / ratio, vW - srcX);
+    const srcH = Math.min(cssH / ratio, vH - srcY);
+
+    return { ratio, offsetX, offsetY, srcX, srcY, srcW, srcH };
+  }
+
+  // ── Update debug overlay ──
+  function updateDebug() {
+    if (!video.videoWidth) return;
+    const p = calcCropParams();
+    debugInfo.textContent =
+      `ratio=${p.ratio.toFixed(4)} | ` +
+      `offset=(${p.offsetX.toFixed(0)},${p.offsetY.toFixed(0)}) | ` +
+      `src=(${p.srcX.toFixed(0)},${p.srcY.toFixed(0)},${p.srcW.toFixed(0)},${p.srcH.toFixed(0)})`;
+  }
+
+  window.addEventListener('resize', updateDebug);
+
+  // ── Capture ──
+  captureBtn.addEventListener('click', () => {
+    if (!video.videoWidth) return;
+
+    const p = calcCropParams();
+
+    canvas.width  = Math.round(p.srcW);
+    canvas.height = Math.round(p.srcH);
+    ctx.drawImage(video, p.srcX, p.srcY, p.srcW, p.srcH, 0, 0, canvas.width, canvas.height);
+
+    resultImg.src = canvas.toDataURL('image/jpeg', 0.92);
+
+    // Stop camera to release hardware resource
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+
+    cameraContainer.style.display = 'none';
+    resultContainer.style.display = 'flex';
+  });
+
+  // ── Retake ──
+  retakeBtn.addEventListener('click', () => {
+    resultContainer.style.display = 'none';
+    cameraContainer.style.display = 'block';
+    startCamera().catch(() => showError('無法存取相機。\n請確認已允許相機存取權限後重新整理頁面。'));
+  });
+
+  // ── Init ──
+  startCamera().catch(() => showError('無法存取相機。\n請確認已允許相機存取權限後重新整理頁面。'));
+</script>
+
+</body>
+</html>
