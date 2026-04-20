@@ -33,18 +33,15 @@
       object-fit: cover;
     }
 
+    /* top/left/width/height are set by JS */
     #guide-frame {
       position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      width: min(85vw, calc(85vh * 1.58));
-      /* 不使用 aspect-ratio（Safari 15 才支援，需相容 iOS 14.5）*/
-      height: min(calc(85vw / 1.58), 85vh);
       border: 3px solid white;
       box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
       border-radius: 4px;
-      pointer-events: none;
+      cursor: move;
+      touch-action: none;
+      user-select: none;
     }
 
     #guide-label {
@@ -57,6 +54,41 @@
       font-size: 13px;
       letter-spacing: 0.5px;
       text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+      pointer-events: none;
+    }
+
+    /* ── Resize handles (4 corners) ── */
+    .resize-handle {
+      position: absolute;
+      width: 36px;
+      height: 36px;
+      touch-action: none;
+      cursor: nw-resize;
+    }
+
+    .resize-handle[data-corner="tl"] {
+      top: -3px; left: -3px;
+      border-top: 4px solid white;
+      border-left: 4px solid white;
+      cursor: nw-resize;
+    }
+    .resize-handle[data-corner="tr"] {
+      top: -3px; right: -3px;
+      border-top: 4px solid white;
+      border-right: 4px solid white;
+      cursor: ne-resize;
+    }
+    .resize-handle[data-corner="bl"] {
+      bottom: -3px; left: -3px;
+      border-bottom: 4px solid white;
+      border-left: 4px solid white;
+      cursor: sw-resize;
+    }
+    .resize-handle[data-corner="br"] {
+      bottom: -3px; right: -3px;
+      border-bottom: 4px solid white;
+      border-right: 4px solid white;
+      cursor: se-resize;
     }
 
     #debug-info {
@@ -177,7 +209,11 @@
 <div id="camera-container">
   <video id="video" autoplay playsinline muted></video>
   <div id="guide-frame">
-    <div id="guide-label">請將證件放入框內</div>
+    <div id="guide-label">拖曳移動 · 角落縮放</div>
+    <div class="resize-handle" data-corner="tl"></div>
+    <div class="resize-handle" data-corner="tr"></div>
+    <div class="resize-handle" data-corner="bl"></div>
+    <div class="resize-handle" data-corner="br"></div>
   </div>
   <div id="debug-info">等待相機...</div>
   <button id="capture-btn" disabled aria-label="拍照"></button>
@@ -195,19 +231,22 @@
 <canvas id="canvas" style="display:none"></canvas>
 
 <script>
-  const video        = document.getElementById('video');
-  const guideFrame   = document.getElementById('guide-frame');
-  const debugInfo    = document.getElementById('debug-info');
-  const captureBtn   = document.getElementById('capture-btn');
-  const errorMsg     = document.getElementById('error-msg');
+  const video           = document.getElementById('video');
+  const guideFrame      = document.getElementById('guide-frame');
+  const debugInfo       = document.getElementById('debug-info');
+  const captureBtn      = document.getElementById('capture-btn');
+  const errorMsg        = document.getElementById('error-msg');
   const cameraContainer = document.getElementById('camera-container');
   const resultContainer = document.getElementById('result-container');
-  const resultImg    = document.getElementById('result-img');
-  const retakeBtn    = document.getElementById('retake-btn');
-  const canvas       = document.getElementById('canvas');
-  const ctx          = canvas.getContext('2d');
+  const resultImg       = document.getElementById('result-img');
+  const retakeBtn       = document.getElementById('retake-btn');
+  const canvas          = document.getElementById('canvas');
+  const ctx             = canvas.getContext('2d');
 
-  let stream = null;
+  let stream    = null;
+  let dragState = null;
+  const MIN_W   = 80;
+  const MIN_H   = 50;
 
   // ── Error display ──
   function showError(msg) {
@@ -217,12 +256,98 @@
     captureBtn.disabled = true;
   }
 
+  // ── Initialize frame at center with 1.58:1 ratio ──
+  function initFramePosition() {
+    const cW = cameraContainer.offsetWidth;
+    const cH = cameraContainer.offsetHeight;
+    const w  = Math.min(cW * 0.85, cH * 0.85 * 1.58);
+    const h  = w / 1.58;
+    guideFrame.style.width  = w + 'px';
+    guideFrame.style.height = h + 'px';
+    guideFrame.style.left   = ((cW - w) / 2) + 'px';
+    guideFrame.style.top    = ((cH - h) / 2) + 'px';
+  }
+
+  // ── Drag: move entire frame ──
+  guideFrame.addEventListener('pointerdown', (e) => {
+    if (e.target.dataset.corner) return; // let resize handles take over
+    e.preventDefault();
+    dragState = {
+      type:     'drag',
+      startX:   e.clientX,
+      startY:   e.clientY,
+      origLeft: parseInt(guideFrame.style.left) || 0,
+      origTop:  parseInt(guideFrame.style.top)  || 0,
+    };
+    guideFrame.setPointerCapture(e.pointerId);
+  });
+
+  // ── Resize: drag from corner handles ──
+  document.querySelectorAll('.resize-handle').forEach(handle => {
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragState = {
+        type:     'resize',
+        corner:   handle.dataset.corner,
+        startX:   e.clientX,
+        startY:   e.clientY,
+        origLeft: parseInt(guideFrame.style.left)   || 0,
+        origTop:  parseInt(guideFrame.style.top)    || 0,
+        origW:    guideFrame.offsetWidth,
+        origH:    guideFrame.offsetHeight,
+      };
+      handle.setPointerCapture(e.pointerId);
+    });
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!dragState) return;
+
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    const cW = cameraContainer.offsetWidth;
+    const cH = cameraContainer.offsetHeight;
+
+    if (dragState.type === 'drag') {
+      const fW = guideFrame.offsetWidth;
+      const fH = guideFrame.offsetHeight;
+      guideFrame.style.left = Math.max(0, Math.min(cW - fW, dragState.origLeft + dx)) + 'px';
+      guideFrame.style.top  = Math.max(0, Math.min(cH - fH, dragState.origTop  + dy)) + 'px';
+
+    } else {
+      let { origLeft, origTop, origW, origH, corner } = dragState;
+      let newW = origW, newH = origH, newLeft = origLeft, newTop = origTop;
+
+      if (corner.includes('r')) newW = Math.max(MIN_W, origW + dx);
+      if (corner.includes('l')) { newW = Math.max(MIN_W, origW - dx); newLeft = origLeft + origW - newW; }
+      if (corner.includes('b')) newH = Math.max(MIN_H, origH + dy);
+      if (corner.includes('t')) { newH = Math.max(MIN_H, origH - dy); newTop = origTop + origH - newH; }
+
+      // Clamp within viewport
+      newLeft = Math.max(0, Math.min(cW - MIN_W, newLeft));
+      newTop  = Math.max(0, Math.min(cH - MIN_H, newTop));
+      newW    = Math.max(MIN_W, Math.min(cW - newLeft, newW));
+      newH    = Math.max(MIN_H, Math.min(cH - newTop,  newH));
+
+      guideFrame.style.left   = newLeft + 'px';
+      guideFrame.style.top    = newTop  + 'px';
+      guideFrame.style.width  = newW    + 'px';
+      guideFrame.style.height = newH    + 'px';
+    }
+
+    updateDebug();
+  });
+
+  window.addEventListener('pointerup',     () => { dragState = null; });
+  window.addEventListener('pointercancel', () => { dragState = null; });
+
   // ── Start camera ──
   async function startCamera() {
-    errorMsg.style.display = 'none';
+    errorMsg.style.display  = 'none';
     debugInfo.style.display = '';
-    captureBtn.disabled = true;
-    debugInfo.textContent = '等待相機...';
+    captureBtn.disabled     = true;
+    debugInfo.textContent   = '等待相機...';
 
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -233,7 +358,6 @@
         }
       });
     } catch (_) {
-      // Desktop fallback: no facingMode constraint
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: true });
       } catch (err) {
@@ -245,29 +369,22 @@
     video.srcObject = stream;
   }
 
-  // ── Enable button once video metadata is ready ──
   video.addEventListener('loadedmetadata', () => {
     captureBtn.disabled = false;
     updateDebug();
   });
 
-  // ── Calculate crop parameters ──
-  // Accounts for object-fit: cover offset so the cropped region
-  // matches exactly what is visible inside the guide frame.
+  // ── Calculate crop parameters (compensates for object-fit: cover offset) ──
   function calcCropParams() {
     const displayW = video.offsetWidth;
     const displayH = video.offsetHeight;
     const vW = video.videoWidth;
     const vH = video.videoHeight;
 
-    // CSS-pixel-per-video-pixel scale under object-fit: cover
-    const ratio = Math.max(displayW / vW, displayH / vH);
-
-    // Margins cropped by cover (in video pixels)
+    const ratio   = Math.max(displayW / vW, displayH / vH);
     const offsetX = (vW - displayW / ratio) / 2;
     const offsetY = (vH - displayH / ratio) / 2;
 
-    // Guide frame position relative to the video element (CSS pixels)
     const frameRect = guideFrame.getBoundingClientRect();
     const videoRect = video.getBoundingClientRect();
 
@@ -276,41 +393,41 @@
     const cssW = frameRect.width;
     const cssH = frameRect.height;
 
-    // Convert to video pixel coordinates
     const srcX = Math.max(0, cssX / ratio + offsetX);
     const srcY = Math.max(0, cssY / ratio + offsetY);
-    // Clamp srcW/srcH so drawImage never exceeds video boundaries (Safari silent fail)
     const srcW = Math.min(cssW / ratio, vW - srcX);
     const srcH = Math.min(cssH / ratio, vH - srcY);
 
     return { ratio, offsetX, offsetY, srcX, srcY, srcW, srcH };
   }
 
-  // ── Update debug overlay ──
+  // ── Debug overlay — shows current frame ratio for prototype testing ──
   function updateDebug() {
     if (!video.videoWidth) return;
-    const p = calcCropParams();
+    const p          = calcCropParams();
+    const frameRatio = (guideFrame.offsetWidth / guideFrame.offsetHeight).toFixed(3);
     debugInfo.textContent =
-      `ratio=${p.ratio.toFixed(4)} | ` +
-      `offset=(${p.offsetX.toFixed(0)},${p.offsetY.toFixed(0)}) | ` +
-      `src=(${p.srcX.toFixed(0)},${p.srcY.toFixed(0)},${p.srcW.toFixed(0)},${p.srcH.toFixed(0)})`;
+      `框 ${frameRatio}:1  |  ` +
+      `src (${p.srcX.toFixed(0)}, ${p.srcY.toFixed(0)})  ` +
+      `${p.srcW.toFixed(0)}×${p.srcH.toFixed(0)}px`;
   }
 
-  window.addEventListener('resize', updateDebug);
+  window.addEventListener('resize', () => {
+    if (!dragState) initFramePosition();
+    updateDebug();
+  });
 
   // ── Capture ──
   captureBtn.addEventListener('click', () => {
     if (!video.videoWidth) return;
 
     const p = calcCropParams();
-
     canvas.width  = Math.round(p.srcW);
     canvas.height = Math.round(p.srcH);
     ctx.drawImage(video, p.srcX, p.srcY, p.srcW, p.srcH, 0, 0, canvas.width, canvas.height);
 
     resultImg.src = canvas.toDataURL('image/jpeg', 0.92);
 
-    // Stop camera to release hardware resource
     if (stream) {
       stream.getTracks().forEach(t => t.stop());
       stream = null;
@@ -328,6 +445,7 @@
   });
 
   // ── Init ──
+  initFramePosition();
   startCamera().catch(() => showError('無法存取相機。\n請確認已允許相機存取權限後重新整理頁面。'));
 </script>
 
